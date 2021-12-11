@@ -1399,3 +1399,1371 @@ int main()
 因此，C++标准库提供了`std::recursive_mutex`类。除了可以在同一线程的单个实例上多次上锁，其他功能与`std::mutex`相同。
 
 嵌套锁一般用在可并发访问的类上，所以使用互斥量保护其成员数据。
+
+# 第4章 同步操作
+
+## 4.1 等待事件或条件
+
+当一个线程等待另一个线程完成时，可以持续的检查共享数据标志(用于做保护工作的互斥量)，直到另一线程完成工作时对这个标识进行重置。不过，这种方式会消耗线程的执行时间检查标识，并且当互斥量上锁后，其他线程就没有办法获取锁，就会持续等待。
+
+另外，也可以在等待线程在检查间隙，使用`std::this_thread::sleep_for()`进行周期性的间歇
+
+```c++
+bool flag;
+std::mutex m;
+
+void wait_for_flag()
+{
+  std::unique_lock<std::mutex> lk(m);
+  while(!flag)
+  {
+    lk.unlock();  // 解锁互斥量
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));  // 休眠100ms
+    // 休眠期间其他线程就有机会获取mutex并设置flag
+    lk.lock();   // 再锁互斥量
+  }
+}
+```
+
+但很难确定正确的休眠时间。太短的休眠和没有一样，都会浪费执行时间。太长的休眠时间，可能会让任务等待时间过久。
+
+第三个选择(也是优先选择的)，使用C++标准库提供的工具去等待事件的发生。通过另一线程触发等待事件的机制是最基本的唤醒方式，这种机制就称为“**条件变量**”。当某些线程被终止时，为了唤醒等待线程(允许等待线程继续执行)，终止线程将会向等待着的线程广播“条件达成”的信息。
+
+### 等待条件达成
+
+C++标准库对条件变量有两套实现：`std::condition_variable`和`std::condition_variable_any`，两者都需要与互斥量一起才能工作(互斥量是为了同步)。
+
+前者仅能与`std::mutex`一起工作，通常作为首选类型。而后者可以和合适的互斥量一起工作，更加通用，不过在性能和系统资源的使用方面会有更多的开销，当对灵活性有要求时，才会考虑。
+
+代码4.1 使用`std::condition_variable`处理数据等待
+
+```c++
+std::mutex mut;
+std::queue<data_chunk> data_queue;
+std::condition_variable data_cond;
+
+void data_preparation_thread()
+{
+    while(more_data_to_prepare())
+    {
+        data_chunk const data=prepare_data();
+        std::lock_guard<std::mutex> lk(mut);// 锁定队列
+        data_queue.push(data);// 将准备好的数据压入队列
+        data_cond.notify_one();// 对等待的线程(如果有等待线程)进行通知，并重新检查
+    }
+}
+
+void data_processing_thread()
+{
+    while(true)
+    {
+        // 传给wait的只能是std::unique_lock
+        std::unique_lock<std::mutex> lk(mut);// 首先对互斥量上锁
+        // 当条件满足时返回，条件不满足将解锁互斥量，并且将线程置于阻塞或等待状态
+        data_cond.wait(lk,[]{return !data_queue.empty();});// Lambda函数返回值作为等待的条件
+        data_chunk data=data_queue.front();
+        data_queue.pop();
+        lk.unlock();
+        process(data);
+        if(is_last_chunk(data))
+            break;
+    }
+}
+```
+
+为什么用`std::unique_lock`而不使用`std::lock_guard`的原因：等待中的线程必须在等待期间解锁互斥量，并对互斥量再次上锁，而`std::lock_guard`没有这么灵活。
+
+当等待线程重新获取互斥量并检查条件变量时，并非直接响应另一个线程的通知，就是所谓的*伪唤醒*(spurious wakeup)。
+
+本质上，` std::condition_variable::wait`是“忙碌-等待”的优化。下面用简单的循环实现了一个“忙碌-等待”：
+
+```c++
+template<typename Predicate>
+void minimal_wait(std::unique_lock<std::mutex>& lk, Predicate pred){
+  while(!pred()){
+    lk.unlock();
+    lk.lock();
+  }
+}
+```
+
+### 构建线程安全队列
+
+使用队列在多个线程中转移数据很常见。做得好的话，同步操作可以在队列内部完成，这样同步问题和条件竞争出现的概率也会降低。
+
+代码4.2 `std::queue`接口
+
+```c++
+template <class T, class Container = std::deque<T> >
+class queue {
+public:
+  explicit queue(const Container&);
+  explicit queue(Container&& = Container());
+  template <class Alloc> explicit queue(const Alloc&);
+  template <class Alloc> queue(const Container&, const Alloc&);
+  template <class Alloc> queue(Container&&, const Alloc&);
+  template <class Alloc> queue(queue&&, const Alloc&);
+
+  void swap(queue& q);
+
+  bool empty() const;
+  size_type size() const;
+
+  T& front();
+  const T& front() const;
+  T& back();
+  const T& back() const;
+
+  void push(const T& x);
+  void push(T&& x);
+  void pop();
+  template <class... Args> void emplace(Args&&... args);
+};
+```
+
+和[std::stack](https://en.cppreference.com/w/cpp/container/stack)一样，[std::queue](https://en.cppreference.com/w/cpp/container/queue)的接口设计存在固有竞争，因此，需要将front()和pop()合并成一个函数调用，就像之前在栈实现时合并top()和pop()一样。不同的是，当队列在多个线程中传递数据时，接收线程通常需要等待数据的压入。这里提供pop()函数的两个变种：try_pop()和wait_and_pop()。
+
+代码4.3 线程安全队列的接口
+
+```c++
+template<typename T>
+class threadsafe_queue
+{
+public:
+    threadsafe_queue();
+    threadsafe_queue(const threadsafe_queue&);
+    threadsafe_queue& operator=(const threadsafe_queue&) = delete;// 不允许简单的赋值
+
+    void push(T new_value);
+
+    //尝试从队列中弹出数据，即使没有值可检索，也会直接返回
+    bool try_pop(T& value);
+    std::shared_ptr<T> try_pop();//当没有值可检索时，这个函数返回NULL
+
+    //将会等待有值可检索的时候才返回
+    void wait_and_pop(T& value);
+    std::shared_ptr<T> wait_and_pop();
+
+    bool empty() const;
+};
+```
+
+代码4.5 使用条件变量的线程安全队列(完整版)
+
+```c++
+template<typename T>
+class threadsafe_queue
+{
+private:
+    mutable std::mutex mut;// 互斥量必须是可变的 
+    std::queue<T> data_queue;
+    std::condition_variable data_cond;
+public:
+    threadsafe_queue()
+    {}
+    threadsafe_queue(threadsafe_queue const& other)
+    {
+        //其他线程可能有非const引用对象，并调用变种成员函数
+        //所以这里有必要对互斥量上锁
+        std::lock_guard<std::mutex> lk(other.mut);
+        data_queue=other.data_queue;
+    }
+
+    void push(T new_value)
+    {
+        std::lock_guard<std::mutex> lk(mut);
+        data_queue.push(new_value);
+        data_cond.notify_one();
+    }
+
+    void wait_and_pop(T& value)
+    {
+        std::unique_lock<std::mutex> lk(mut);
+        data_cond.wait(lk,[this]{return !data_queue.empty();});
+        value=data_queue.front();
+        data_queue.pop();
+    }
+
+    std::shared_ptr<T> wait_and_pop()
+    {
+        std::unique_lock<std::mutex> lk(mut);
+        data_cond.wait(lk,[this]{return !data_queue.empty();});
+        std::shared_ptr<T> res(std::make_shared<T>(data_queue.front()));
+        data_queue.pop();
+        return res;
+    }
+
+    bool try_pop(T& value)
+    {
+        std::lock_guard<std::mutex> lk(mut);
+        if(data_queue.empty)
+            return false;
+        value=data_queue.front();
+        data_queue.pop();
+        return true;
+    }
+
+    std::shared_ptr<T> try_pop()
+    {
+        std::lock_guard<std::mutex> lk(mut);
+        if(data_queue.empty())
+            return std::shared_ptr<T>();
+        std::shared_ptr<T> res(std::make_shared<T>(data_queue.front()));
+        data_queue.pop();
+        return res;
+    }
+
+    bool empty() const
+    {
+        // 其他线程可能有此对象（拷贝构造）所以要上锁
+        std::lock_guard<std::mutex> lk(mut);
+        return data_queue.empty();
+    }
+};
+
+//线程队列中有互斥量和条件变量，所以独立的变量就不需要了
+threadsafe_queue<data_chunk> data_queue; 
+void data_preparation_thread()
+{
+    while(more_data_to_prepare())
+    {
+        data_chunk const data=prepare_data();
+        data_queue.push(data);//push()不需要外部同步
+    }
+}
+
+void data_processing_thread()
+{
+    while(true)
+    {
+        data_chunk data;
+        data_queue.wait_and_pop(data);//兼顾条件变量的等待
+        process(data);
+        if(is_last_chunk(data))
+            break;
+    }
+}
+```
+
+很多线程等待同一事件：在共享数据初始化的时候，当处理线程使用同一数据时，就要等待数据被初始化，或等待共享数据的更新，这些情况下，线程准备好数据时，就会通过条件变量调用notify_all()，而非调用notify_one()。这就是全部线程在都去执行wait()(检查他们等待的条件是否满足)的原因。当条件为true时，等待线程只等待一次，就不会再等待条件变量了。
+
+## 4.2 使用future
+
+当线程需要等待特定事件(future)时，某种程度上来说就需要知道期望的结果。之后，线程会周期性(较短的周期)的等待或检查事件是否触发，检查期间也会执行其他任务。另外，等待任务期间也可以先执行另外的任务，直到对应的任务触发，而后等待future的状态会变为就绪状态。当事件发生时(状态为就绪)，这个future就不能重置了。
+
+C++标准库中有两种future: unique future(`std::future<>`)和shared futures(`std::shared_future<>`)
+
+- `std::future`只能与指定事件相关联，future对象本身并不提供同步访问。当多个线程需要访问一个独立future对象时，必须使用互斥量或类似同步机制进行保护。
+
+- `std::shared_future`能关联多个事件，所有实例会在同时变为就绪状态，并且可以访问与事件相关的数据。当多个线程对一个`std::shared_future<>`副本进行访问，即使同一个异步结果，也不需要同步future。
+
+[并行技术规范](https://en.cppreference.com/w/cpp/experimental/concurrency)将这两个模板类在`std::experimental`命名空间中进行了扩展：`std::experimental::future<>`和`std::experimental::shared_future<> `。
+
+### 后台任务的返回值
+
+最简单的事件，就是在后台运行的计算操作。而`std::thread` 执行的任务不能有返回值，不过这个问题能使用future进行解决。
+
+```c++
+int f()
+{
+  return 1;
+}
+
+int main()
+{
+  std::thread t(f); // 如何读取f的返回值？
+  t.join();
+}
+```
+
+当不着急让任务结果时，可以使用`std::async`启动一个异步任务。与`std::thread`对象等待的方式不同，`std::async`会返回一个`std::future`对象，这个对象持有最终计算出来的结果。当需要这个值时，只需要调用这个对象的get()成员函数，就会阻塞线程直到future为就绪为止，并返回计算结果。
+
+代码4.6 `std::future`从异步任务中获取返回值
+
+```c++
+int f()
+{
+  return 1;
+}
+
+int main()
+{
+  std::future<int> ft = std::async(f);
+  std::cout << ft.get(); 
+}
+```
+
+[std::async](https://en.cppreference.com/w/cpp/thread/async)和[std::thread](https://en.cppreference.com/w/cpp/thread/thread)一样支持额外的函数参数和移动操作
+
+代码4.7 使用`std::async`向函数传递参数
+
+```c++
+// 函数
+int f(int);
+auto ft = std::async(f, 42);
+
+// 成员函数
+struct A {
+  int f(int);
+};
+
+A a;
+auto ft1 = std::async(&A::f, &a, 42); // 调用p->f(42)，p是指向x的指针
+auto ft2 = std::async(&A::f, a, 42); // 调用tmpa.f(42)，tmpa是a的副本
+
+// 函数对象
+struct A {
+  int operator()(int);
+};
+A a;
+auto ft1 = std::async(A(), 42); // 调用tmpa(42)，tmpa由A的移动构造函数获得
+auto ft2 = std::async(std::ref(a), 42); // 调用a(42)
+
+class move_only
+{
+public:
+  move_only();
+  move_only(move_only&&)
+  move_only(move_only const&) = delete;
+  move_only& operator=(move_only&&);
+  move_only& operator=(move_only const&) = delete;
+  
+  void operator()();
+};
+auto ft3=std::async(move_only());  // 调用tmp()，tmp是通过std::move(move_only())构造得到
+```
+
+[std::async](https://en.cppreference.com/w/cpp/thread/async)还可以设置第一个参数为线程的创建策略
+
+```c++
+int f();
+// 函数必须异步执行，即运行在不同的线程上
+auto ft1 = std::async(std::launch::async, f);
+// 函数只在返回的期值调用get或wait时运行
+auto ft2 = std::async(std::launch::deferred, f);
+// 不指定时的默认启动策略是对两者进行或运算的结果
+// auto ft3 = std::async(f)等价于
+auto ft3 = std::async(std::launch::async | std::launch::deferred, f);
+```
+
+使用`std::async`会将算法分割到各个任务中，这样程序就能并发了。不过，这不是让`std::future`与任务实例相关联的唯一方式，也可以将任务包装入`std::packaged_task<>`中，或通过编写代码的方式，使用`std::promise<>`模板显式设置值。与`std::promise<>`相比，`std::packaged_task<>`具有更高的抽象。
+
+### future与任务关联
+
+`std::packaged_task<>`会将future与函数或可调用对象进行绑定。当调用`std::packaged_task<>`对象时，就会调用相关函数或可调用对象，当future状态为就绪时，会存储返回值。
+
+```c++
+int f();
+
+std::packaged_task<int()> pt(f);
+auto ft = pt.get_future();//返回std::future<int>的类型
+pt(); // 调用std::packaged_task对象，将std::future设为就绪
+std::cout << ft.get();
+```
+
+**线程间传递任务**
+
+很多图形架构需要特定的线程去更新界面，所以当线程对界面更新时，需要发出一条信息给正确的线程，让相应的线程来做界面更新。`std::packaged_task`提供了这种功能，且不需要发送一条自定义信息给图形界面线程。
+
+代码4.9 使用`std::packaged_task`执行一个图形界面线程
+
+```c++
+std::mutex m;
+std::deque<std::packaged_task<void()> > tasks;
+
+bool gui_shutdown_message_received();
+void get_and_process_gui_message();
+
+void gui_thread()// 更新GUI的指定线程
+{
+    while(!gui_shutdown_message_received()) // 未收到终止消息则一直轮询
+    {
+        get_and_process_gui_message(); // 处理收到的消息
+        std::packaged_task<void()> task;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            if(tasks.empty())//当队列中没有任务，循环将继续
+                continue;
+            task=std::move(tasks.front());//除非能在队列中提取出一个任务
+            tasks.pop_front();
+        }
+        task();//释放队列上的锁，并且执行任务
+    }
+}
+
+std::thread gui_bg_thread(gui_thread);
+
+template<typename Func>
+std::future<void> post_task_for_gui_thread(Func f)//将任务传入队列
+{
+    std::packaged_task<void()> task(f);//提供一个打包好的任务
+    std::future<void> res=task.get_future();//调用get_future()成员函数获取future对象
+    std::lock_guard<std::mutex> lk(m);
+    tasks.push_back(std::move(task));
+    return res;//并且在任务推入列表之前，future将返回调用函数。
+}
+```
+
+### 使用std::promises
+
+当需要处理很多网络连接时，会使用不同线程尝试连接每个接口，能使网络尽早联通。不幸的是，随着连接数量的增长，大量的线程会消耗大量的系统资源，还有可能造成线程上下文频繁切换。因此通过少数线程处理网络连接，每个线程同时处理多个连接，对需要处理大量网络连接的应用而言，这是一种比较普遍的做法。
+
+`std::promise<T>`提供设定值的方式(类型为T)，这个类型会和后面看到的`std::future<T>`对象相关联。
+
+`std::promise/std::future`对提供一种机制：**future可以阻塞等待线程，提供数据的线程可以使用promise对相关值进行设置，并将future的状态置为“就绪”。**
+
+可以通过给定的`std::promise`的get_future()成员函数来获取与之相关的`std::future`对象，与`std::packaged_task`的用法类似。当promise设置完毕(使用set_value()成员函数)时，对应的future状态就变为“就绪”，并且可用于检索已存储的值。当设置值之前销毁`std::promise`，将会存储一个异常。
+
+[std::promise](https://en.cppreference.com/w/cpp/thread/promise)可以显式设置值
+
+```c++
+std::promise<int> ps;
+std::future<int> ft = ps.get_future();
+ps.set_value(42); // set_value还会将状态设置为就绪
+std::cout << ft.get(); // 42
+```
+
+在线程间对状态发送信号
+
+```c++
+void f(std::promise<void> ps)
+{
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  ps.set_value();
+}
+
+int main()
+{
+  std::promise<void> ps;
+  std::future<void> ft = ps.get_future();
+  std::thread t(f, std::move(ps));
+  ft.wait(); // 阻塞直到set_value，相当于没有返回值的get
+  t.join();
+}
+```
+
+代码4.10 使用promise解决单线程多连接问题
+
+```c++
+void process_connections(connection_set& connections)
+{
+    while(!done(connections))
+    {
+        for(connection_iterator
+                connection=connections.begin(),end=connections.end();
+            connection!=end;
+            ++connection)//检查每个连接
+        {
+            if(connection->has_incoming_data())//检索是否有接收数据
+            {
+                data_packet data=connection->incoming();
+                std::promise<payload_type>& p=
+                    connection->get_promise(data.id);//一个ID映射到一个std::promise
+                p.set_value(data.payload);
+            }
+            if(connection->has_outgoing_data())//检索是否有传出数据
+            {
+                outgoing_packet data=
+                    connection->top_of_outgoing_queue();//在传出队列中检索
+                connection->send(data.payload);//包的有效负载
+                data.promise.set_value(true);//来表明传输成功
+            }
+        }
+    }
+}
+```
+
+一个[std::promise](https://en.cppreference.com/w/cpp/thread/promise)只能关联一个[std::future](https://en.cppreference.com/w/cpp/thread/future)，关联多次时将抛出[std::future_error](https://en.cppreference.com/w/cpp/thread/future_error)异常
+
+```c++
+std::promise<int> ps;
+auto ft1 = ps.get_future();
+auto ft2 = ps.get_future(); // 抛出std::future_error异常
+```
+
+### 将异常存与future中
+
+当你传递-1到f()中时，它将抛出一个异常，并且你想让调用者看到这个异常：
+
+```c++
+int f(int x)
+{
+  if (x < 0)
+  {
+    throw std::out_of_range("x < 0");
+  }
+  return 1;
+}
+
+int main()
+{
+  auto ft = std::async(f, -1); // ft将存储异常
+  int x = ft.get(); // 抛出已存储的异常
+}
+```
+
+当然，通过函数的显式调用，`std::promise`也能提供同样的功能。当存入的是异常而非数值时，就需要调用set_exception()成员函数，而非set_value()。这通常是用在一个catch块中，并作为算法的一部分。为了捕获异常，这里使用异常填充promise：
+
+```c++
+int main()
+{
+  std::promise<int> ps;
+  auto ft = ps.get_future();
+  std::thread t([&ps]
+  {
+    try
+    {
+      ps.set_value(f(-1)); // 此时还没有存储异常
+    }
+    catch(...)
+    {
+      //ps.set_exception(std::copy_exception(std::logic_error("ps ")));//存储新的异常而不抛出
+      ps.set_exception(std::current_exception()); // 检索抛出的异常
+    }
+  });
+  t.join();
+  ft.get(); // 抛出异常
+}
+
+```
+
+如果[std::packaged_task](https://en.cppreference.com/w/cpp/thread/packaged_task)和[std::promise](https://en.cppreference.com/w/cpp/thread/promise)直到析构都未设置值，[std::future::get](https://en.cppreference.com/w/cpp/thread/future/get)也会抛出[std::future_error](https://en.cppreference.com/w/cpp/thread/future_error)异常
+
+```c++
+int f();
+
+int main()
+{
+  std::future<int> ft;
+  {
+    std::packaged_task<int()> pt(f);
+    ft = pt.get_future();
+    // std::promise<int> ps;
+    // ft = ps.get_future();
+  }
+  ft.get(); // 抛出异常
+}
+```
+
+### 多个线程的等待
+
+多线程在没有额外同步的情况下，访问独立`std::future`对象时，就会有数据竞争和未定义行为。因为`std::future`独享同步结果，并且通过调用get()函数，一次性的获取数据，这就让并发访问变的毫无意义。
+
+如果并行代码没办法让多个线程等待同一个事件，`std::shared_future`可以帮你解决这个问题。
+
+因为`std::future`是只移动的，所以其所有权可以在不同的实例中互相传递，但只有一个实例可以获得特定的同步结果，而`std::shared_future`实例是可拷贝的，所以多个对象可以引用同一关联期望值的结果。
+
+每一个[std::shared_future](https://en.cppreference.com/w/cpp/thread/shared_future)对象上返回的结果不同步，为了避免多线程访问同一[std::shared_future](https://en.cppreference.com/w/cpp/thread/shared_future)对象时的数据竞争就必须加锁保护。更好的方法是给每个线程拷贝一个[std::shared_future](https://en.cppreference.com/w/cpp/thread/shared_future)对象，这样就可以安全访问而无需加锁。
+
+![](images/4-1-1.png)
+
+![](images/4-1-2.png)
+
+图4.1 使用多个`std::shared_future`对象来避免数据竞争
+
+`std::shared_future`的实例同步`std::future`实例的状态。当`std::future`对象没有与其他对象共享同步状态所有权，那么所有权必须使用`std::move`将所有权传递到`std::shared_future`，其默认构造函数如下：
+
+```c++
+std::promise<int> p;
+std::future<int> f(p.get_future());
+assert(f.valid());  // 期望值 f 是合法的,因为引用的是promise p的同步状态
+std::shared_future<int> sf(std::move(f));//转移sf的状态后
+assert(!f.valid());  // 期望值 f 现在是不合法的
+assert(sf.valid());  // sf 现在是合法的
+```
+
+可以通过`std::promise`对象的成员函数get_future()的返回值，直接构造一个`std::shared_future`对象
+
+```c++
+std::promise<std::string> p;
+std::shared_future<std::string> sf(p.get_future());  // 隐式转移所有权
+```
+
+`std::future`有一个share()成员函数，可用来创建新的`std::shared_future` ，并且可以直接转移future的所有权。这样也就能保存很多类型，并且使得代码易于修改：
+
+```c++
+std::promise<int> p;
+auto sf=p.get_future().share();//sf的类型推导为std::shared_future<int>
+```
+
+## 4.3 限时等待
+
+阻塞调用会将线程挂起一段(不确定的)时间，直到相应的事件发生。在一些情况下，需要限定线程等待的时间。
+
+这里介绍两种指定超时方式：一种是“时间段”，指定一段时间(例如，30毫秒)，另一种是“时间点”，指定一个时间点(2011年11月30日)。处理持续时间的变量以`_for`作为后缀，处理绝对时间的变量以`_until`作为后缀。
+
+### 时钟
+
+对于C++标准库来说，时钟就是时间信息源。并且，时钟是一个类，`<chrono>`提供了四种不同的信息：
+
+* 当前时间：[std::chrono::system_clock::now()](https://en.cppreference.com/w/cpp/chrono/system_clock/now)
+* 时间类型：[std::chrono::time_point](https://en.cppreference.com/w/cpp/chrono/time_point)
+* 时钟节拍：一个时钟一秒有25个节拍：[std::ratio<1, 25>](https://en.cppreference.com/w/cpp/numeric/ratio/ratio)
+* 稳定时钟：[std::chrono::steady_clock::is_steady](https://en.cppreference.com/w/cpp/chrono/steady_clock)(稳定时钟，代表系统时钟的真实时间)、[std::chrono::system_clock::is_steady](https://en.cppreference.com/w/cpp/chrono/system_clock)(一般因为时钟可调节而不稳定，即使这是为了考虑本地时钟偏差的自动调节)、[high_resolution_clock::is_steady](https://en.cppreference.com/w/cpp/chrono/high_resolution_clock)(最小节拍最高精度的时钟)
+
+打印当前系统时间（如果出现localtime不安全的警告，则在`配置属性 - C/C++ - 预处理器 - 预处理器定义`添加`_CRT_SECURE_NO_WARNINGS`）
+
+```c++
+std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
+std::time_t now_c = std::chrono::system_clock::to_time_t(now); // 转为整数
+std::cout << std::put_time(std::localtime(&now_c), "%F %T"); // %F即%Y-%m-%d，%T即%H:%M:%S
+```
+
+### 时间段
+
+标准库提供了表示时间间隔类型的[std::chrono::duration](https://zh.cppreference.com/w/cpp/chrono/duration)
+
+```c++
+// 比如将表示秒的类型定义为
+std::duration<int> // 即std::chrono::seconds
+// 则表示分的类型可定义为
+std::duration<int, std::ratio<60>> // 即std::chrono::minutes
+// 表示毫秒的类型可定义为
+std::duration<int, std::ratio<1, 1000>> // 即std::chrono::milliseconds
+```
+
+C++14的[std::chrono_literals](https://en.cppreference.com/w/cpp/language/user_literal%23Standard_library)提供了表示时间的后缀
+
+```c++
+using namespace std::chrono_literals;
+auto x = 45min; // 等价于std::chrono::minutes(45)
+std::cout << x.count(); // 45
+auto y = std::chrono::duration_cast<std::chrono::seconds>(x);
+std::cout << y.count(); // 2700
+auto z = std::chrono::duration_cast<std::chrono::hours>(x);
+std::cout << z.count(); // 0（转换会截断）
+```
+
+标准库通过字面值运算符模板实现此后缀功能
+
+```c++
+constexpr std::chrono::minutes operator ""min(unsigned long long m)
+{
+  return std::chrono::minutes(m);
+}
+```
+
+duration支持四则运算
+
+```c++
+using namespace std::chrono_literals;
+auto x = 1h;
+auto y = 15min;
+auto z = x - 2 * y;
+std::cout << z.count(); // 30
+```
+
+使用duration即可设置等待时间
+
+```c++
+int f();
+auto ft = std::async(f);
+
+using namespace std::chrono_literals;
+if (ft.wait_for(1s) == std::future_status::ready)
+{
+  std::cout << ft.get();
+}
+```
+
+### 时间点
+
+time_point是表示时间的类型，值为从某个时间点（比如unix时间戳：1970年1月1日0时0分）开始计时的时间长度
+
+```c++
+// 第一个模板参数为开始时间点的时钟类型，第二个为时间单位
+std::chrono::time_point<std::chrono::system_clock, std::chrono::seconds>
+```
+
+time_point可以加减dutation
+
+```c++
+using namespace std::chrono_literals;
+auto x = std::chrono::high_resolution_clock::now();
+auto y = x + 1s;
+std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(y - x).count();
+```
+
+两个time_point也能相减
+
+```c++
+auto start = std::chrono::high_resolution_clock::now();
+doSomething();
+auto stop = std::chrono::high_resolution_clock::now();
+std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(stop start).count();
+```
+
+使用绝对的时间点来设置等待时间
+
+```c++
+std::condition_variable cv;
+bool done;
+std::mutex m;
+
+bool wait_loop()
+{
+  const auto timeout = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  std::unique_lock<std::mutex> l(m);
+  while (!done)
+  {
+    if (cv.wait_until(l, timeout) == std::cv_status::timeout) break;
+  }
+  return done;
+}
+```
+
+### 使用超时
+
+timeout可以用于休眠，比如[std::this_thread::sleep_for](https://en.cppreference.com/w/cpp/thread/sleep_for)和[std::this_thread::sleep_until](https://en.cppreference.com/w/cpp/thread/sleep_until)，此外timeout还能配合条件变量、期值甚至mutex使用。[std::mutex](https://en.cppreference.com/w/cpp/thread/mutex)和[std::recursive_mutex](https://en.cppreference.com/w/cpp/thread/recursive_mutex)不支持timeout，而[std::timed_mutex](https://en.cppreference.com/w/cpp/thread/timed_mutex)和[std::recursive_timed_mutex](https://en.cppreference.com/w/cpp/thread/recursive_timed_mutex)支持，它们提供了[try_lock_for](https://en.cppreference.com/w/cpp/thread/timed_mutex/try_lock_for)和[try_lock_until](https://en.cppreference.com/w/cpp/thread/timed_mutex/try_lock_until)
+
+表4.1 可接受超时的函数
+
+<table border=1>
+  <td>类型/命名空间</td>
+  <td>函数</td>
+  <td>返回值</td>
+<tr>
+  <td rowspan=2> std::this_thread 命名空间 </td>
+  <td> sleep_for(duration) </td>
+  <td rowspan=2>N/A</td>
+</tr>
+<tr>
+  <td>sleep_until(time_point)</td>
+</tr>
+<tr>
+  <td rowspan = 2>std::condition_variable 或 std::condition_variable_any</td>
+  <td>wait_for(lock, duration)</td>
+  <td rowspan = 2>std::cv_status::time_out 或 std::cv_status::no_timeout</td>
+</tr>
+<tr>
+  <td>wait_until(lock, time_point)</td>
+</tr>
+<tr>
+  <td rowspan = 2> </td>
+  <td> wait_for(lock, duration, predicate)</td>
+  <td rowspan = 2>bool —— 当唤醒时，返回谓词的结果</td>
+</tr>
+<tr>
+  <td>wait_until(lock, duration, predicate)</td>
+</tr>
+<tr>
+  <td rowspan = 2>std::timed_mutex 或 std::recursive_timed_mutex</td>
+  <td>try_lock_for(duration)</td>
+  <td rowspan = 2> bool —— 获取锁时返回true，否则返回fasle</td>
+</tr>
+<tr>
+  <td>try_lock_until(time_point)</td>
+</tr>
+<tr>
+  <td rowspan = 2>std::unique_lock&lt;TimedLockable&gt;</td>
+  <td>unique_lock(lockable, duration)</td>
+  <td>N/A —— 对新构建的对象调用owns_lock();</td>
+</tr>
+<tr>
+  <td>unique_lock(lockable, time_point)</td>
+  <td>当获取锁时返回true，否则返回false</td>
+</tr>
+<tr>
+  <td rowspan = 2></td>
+  <td>try_lock_for(duration)</td>
+  <td rowspan = 2>bool —— 当获取锁时返回true，否则返回false</td>
+</tr>
+<tr>
+  <td>try_lock_until(time_point)</td>
+</tr>
+<tr>
+  <td rowspan = 3>std::future&lt;ValueType&gt;或std::shared_future&lt;ValueType&gt;</td>
+  <td>wait_for(duration)</td>
+  <td>当等待超时，返回std::future_status::timeout</td>
+</tr>
+<tr>
+  <td rowspan = 2>wait_until(time_point)</td>
+  <td>当期望值准备就绪时，返回std::future_status::ready</td>
+</tr>
+<tr>
+  <td>当期望值持有一个为启动的延迟函数，返回std::future_status::deferred</td>
+</tr>
+</table>
+
+## 4.4 简化代码
+
+### 使用future的函数化编程
+
+*函数化编程*(functional programming)是一种编程方式，函数结果只依赖于传入函数的参数。纯粹的函数不会改变任何外部状态，不修改共享数据，就不存在条件竞争，因此也就没有必要使用锁机制。
+
+**快速排序——FP模式版**
+
+该算法的基本思想：给定一个数据列表，然后选取其中一个数为“中间”值，之后将列表中的其他数值分成两组——一组比中间值大，另一组比中间值小。之后对小于“中间”值的组进行排序，并返回排序好的列表，再返回“中间”值，再对比“中间”值大的组进行排序，并返回排序的列表。
+
+![](images/4-2.png)
+
+图4.2 FP-模式的递归排序
+
+代码4.12 快速排序——串行版
+
+```c++
+template<typename T>
+std::list<T> sequential_quick_sort(std::list<T> input)
+{
+    if(input.empty()) return input;
+    std::list<T> result;
+    // std::list::splice用于转移另一个list中的元素到目标list
+    result.splice(result.begin(),input,input.begin());// 将input的首元素移到res中
+    T const& pivot=*result.begin();//使用了引用，避免过多的拷贝
+    //std::partition按条件在原容器上划分为两部分
+    //并返回划分点（第一个不满足条件元素）的迭代器
+    auto divide_point=std::partition(input.begin(),input.end(),
+        [&](T const& t){return t<pivot;});
+    std::list<T> lower_part;
+    //将input列表小于divided_point的值移动到新列表lower_part中,其他数继续留在input列表中
+    lower_part.splice(lower_part.end(),input,input.begin(),
+        divide_point);
+    //指向的值放在“中间”值的前面
+    auto new_lower(sequential_quick_sort(std::move(lower_part)));//递归
+    //指向的值放在“中间”值的后面
+    auto new_higher(equential_quick_sort(std::move(input)));
+    //将result中的结果以正确的顺序进行拼接
+    result.splice(result.end(),new_higher);
+    result.splice(result.begin(),new_lower);
+    return result;
+}
+```
+
+**快速排序——FP模式线程强化版**
+
+使用纯函数模式容易转化为并行版本。
+
+代码4.13 快速排序——并行版
+
+```c++
+template<typename T>
+std::list<T> parallel_quick_sort(std::list<T> input)
+{
+    if(input.empty()) return input;
+    std::list<T> result;
+    result.splice(result.begin(),input,input.begin());
+    T const& pivot=*result.begin();
+    auto divide_point=std::partition(input.begin(),input.end(),
+        [&](T const& t){return t<pivot;});
+    std::list<T> lower_part;
+    lower_part.splice(lower_part.end(),input,input.begin(),
+        divide_point);
+    //使用另一线程对小于“中间”值部分的列表进行排序
+    std::future<std::list<T> > new_lower(
+        std::async(&parallel_quick_sort<T>,std::move(lower_part)));
+    auto new_higher(
+        parallel_quick_sort(std::move(input)));//使用递归进行排序
+    result.splice(result.end(),new_higher);
+    //get()返回一个包含结果的右值引用，这样的结果就是可以移动的
+    result.splice(result.begin(),new_lower.get());// 获取future中的值
+    return result;
+}
+```
+
+函数化编程可算作是并发编程的范型，并且也是*通讯顺序进程*(CSP，Communicating Sequential Processer)的范型，这里的线程没有共享数据，但有通讯通道允许信息在不同线程间进行传递。
+
+### 使用消息传递的同步操作
+
+CSP的思路很简单，如果没有共享数据，每个线程可以完全独立地思考，其行为取决于收到的消息。因此每个线程实际上是一个状态机，收到一条消息时就以某种方式更新状态，并且还可能发送消息给其他线程。
+
+通讯处理没有共享数据，所有消息都是通过消息队列传递，而C++线程共享一块地址空间，所以达不到真正通讯处理要求。所以这就需要引入一些约定，作为应用或者库的作者，必须确保在线程间不会共享数据（当然为了通信，必须共享消息队列）
+
+考虑实现一个ATM应用，这个应用需要处理：取钱时和银行之间的交互情况，以及控制器械接受用户的卡片，显示适当的信息，处理按钮事件，吐出现金，还有退还卡。
+
+一种处理方法是让代码将所有事情分配到三个独立线程上去：一个线程去处理物理机械，一个去处理ATM机的逻辑，还有一个用来与银行通讯，这些线程不共享任何数据。
+
+![](images/4-3.png)
+
+图4.3 一台ATM机的状态机模型(简化)
+
+可以使用一个类进行实现，类中有成员函数可以获取每一个状态。每一个成员函数可以等待从指定集合中传入的信息，以及当进行处理时，这就有可能触发原始状态向另一个状态的转化。
+
+代码4.15 ATM逻辑类的简单实现
+
+```c++
+class atm {
+  messaging::receiver incoming;
+  messaging::sender bank;
+  messaging::sender interface_hardware;
+  void (atm::*state)();
+  std::string account;
+  std::string pin;
+  void waiting_for_card() 
+  {
+    //发送一条信息到接口，让终端显示“等待卡片”的信息
+    interface_hardware.send(display_enter_card());
+    incoming.wait().handle<card_inserted>(  //等待传入一条消息进行处理
+        [&](card_inserted const& msg) 
+        {
+          account = msg.account;  //将用户账号信息缓存到成员变量中
+          pin = "";               //清除PIN信息
+          //发送一条消息到硬件接口，让显示界面提示用户输入PIN
+          interface_hardware.send(display_enter_pin());  
+          state = &atm::getting_pin;  //将线程状态改为“获取PIN”
+        });
+  }
+  void getting_pin();
+
+ public:
+  void run() 
+  {
+    state = &atm::waiting_for_card;  //初始化waiting_for_card的状态
+    try 
+    {
+      for (;;)  //反复执行当前状态的成员函数(无论这个状态时怎么样的)
+      {
+        (this->*state)();
+      }
+    } catch (messaging::close_queue const&) {}
+  }
+};
+```
+
+代码4.16 简单ATM实现中的getting_pin状态函数
+
+```c++
+void atm::getting_pin()
+{
+    incoming.wait()
+        .handle<digit_pressed>(//输入数字
+            [&](digit_pressed const& msg)
+            {
+                unsigned const pin_length=4;
+                pin+=msg.digit;
+                if(pin.length()==pin_length)//最终输入
+                {
+                    bank.send(verify_pin(account,pin,incoming));
+                    state=&atm::verifying_pin;
+                }
+            })
+        .handle<clear_last_pressed>(//清除最后一位数字
+            [&](clear_last_pressed const& msg)
+            {
+                if(!pin.empty())
+                {
+                    pin.resize(pin.length()-1);
+                }
+            })
+        .handle<cancel_pressed>(//取消输入
+            [&](cancel_pressed const& msg)
+            {
+                state=&atm::done_processing;
+            });
+}
+```
+
+这里不需要考虑同步和并发的问题，只要考虑在某个点接受和发送的消息。这个ATM逻辑的状态机与系统的其他部分各自运行在独立的线程上，这种设计方式称为actor model，系统中有多个独立的actor，actor之间可以互相发送消息但不会共享状态，这种方式可以极大简化并发系统的设计。
+
+完整代码：[ATM.cpp]()
+
+### 扩展规范中的持续性并发
+
+[并发TS](https://en.cppreference.com/w/cpp/experimental/concurrency)中提供了[std::experimental::promise](https://en.cppreference.com/w/cpp/experimental/concurrency/promise)和[std::experimental::packaged_task](https://en.cppreference.com/w/cpp/experimental/concurrency/packaged_task)，与标准库唯一不同的是，它们返回[std::experimental::future](https://en.cppreference.com/w/cpp/experimental/future)，这个期值提供了持续性。
+
+假设任务产生了一个结果，并且future持有这个结果。然后，需要写一些代码来处理这个结果。使用`std::future`时，必须等待future的状态变为就绪态，不然就使用全阻塞函数wait()，或是使用wait_for()/wait_unitl()成员函数进行等待。
+
+因此需要处理[std::future](https://en.cppreference.com/w/cpp/thread/future)的结果时，必须等待其调用成员函数，这很不方便。持续性带来的好处是数据就绪就（then）进行处理，调用[std::experimental::future::then](https://en.cppreference.com/w/cpp/experimental/future/then)即可添加持续性
+
+```c++
+int f(std::experimental::future<int>);
+
+std::experimental::future<int> eft;
+auto ft1 = eft(); // std::experimental::future由本身的构造函数生成
+// 添加持续性并返回新的期值，该期值持有持续性调用的结果
+// 与std::async不同，不能传入f的参数
+// 因为参数已经在运行库中定义为了一个就绪的期值
+// 这里f的返回int，因此参数就是std::experimental::future<int>
+auto ft2 = ft1.then(f);
+// then后原期值就无效了
+assert(!ft1.valid());
+assert(ft2.valid());
+```
+
+[std::async](https://en.cppreference.com/w/cpp/thread/async)只能返回[std::future](https://en.cppreference.com/w/cpp/thread/future)，如果想返回[std::experimental::future](https://en.cppreference.com/w/cpp/experimental/future)则需要手动实现一个新的async
+
+代码4.17 使用并发技术扩展规范中的特性，实现与`std::async`等价的功能
+
+```c++
+template<typename Func>
+std::experimental::future<decltype(std::declval<Func>()())>
+spawn_async(Func&& func){
+    std::experimental::promise<
+        decltype(std::declval<Func>()())> p;
+    auto res=p.get_future();
+    std::thread t(
+        [p=std::move(p),f=std::decay_t<Func>(func)]()
+            mutable{
+            try{//将函数的结果存储在future中
+                p.set_value_at_thread_exit(f());
+            } catch(...){//或捕获函数抛出的异常，将异常存到future中
+                p.set_exception_at_thread_exit(std::current_exception());
+            }
+    });
+    t.detach();
+    return res;
+}
+```
+
+### 持续性连接
+
+假设有一些列耗时任务要完成，并且要使用异步多线程完成这些任务，从而减轻主线程的计算压力，例如：用户登录应用时，需要将登录凭证发送给后台，在对身份信息进行验证后，从后台获取用户的账户信息，使用获取到的信息对显示进行更新。
+
+代码4.18 处理用户登录——同步/串行方式
+
+```c++
+void process_login(std::string const& username, std::string const& password)
+{
+  try{
+    user_id const id = backend.authenticate_user(username, password);
+    user_data const info_to_display = backend.request_current_info(id);
+    update_display(info_to_display);
+  } catch(std::exception& e){
+    display_error(e);
+  }
+}
+```
+
+不想阻塞UI线程。使用`std::async`将另一个列表放在后台线程上，不过依旧会阻塞UI线程，等待任务完成的同时，会消耗大量的资源。如果这样的任务很多，可以结束一些等待线程节省资源。
+
+代码4.19 处理用户登录——异步方式
+
+```c++
+std::future<void> process_login(
+  std::string const& username, std::string const& password)
+{
+  return std::async(std::launch::async,[=](){
+    try{
+      user_id consst id = backend.authenticate_user(username, password);
+      user_data const info_to_display = 
+        backend.request_current_info(id);
+      update_display(info_to_display);
+    } catch(std::exception& e){
+      display_error(e);
+    }      
+  });
+}
+```
+
+为了避免线程阻塞，机制需要对每个完成的任务进行连接：持续性。这次将整个任务分成了一系列任务，并且每个任务在完成时回连到前一个任务上。
+
+代码4.20 处理用户登录——持续性方式
+
+```c++
+std::experimental::future<void> process_login(
+  std::string const& username, std::string const& password)
+{
+  return spawn_async([=](){
+    return backend.authenticate_user(username, password);  
+  }).then([](std::experimental::future<user_id> id){
+    return backend.request_current_info(id.get());
+  }).then([](std::experimental::future<user_data> info_to_display){
+    try{
+      update_display(info_to_display.get());
+    } catch(std::exception& e){
+      display_error(e);
+    }
+  });
+}
+```
+
+如果调用后台函数内部阻塞，可能是因为需要等待消息通过网络或者完成一个数据库操作，而你还没有完成这些。你可能会把任务划分为多个独立部分，但它们仍会阻塞调用，最终仍会得到阻塞的线程。这时后台调用真正需要的是在数据准备好时返回就绪的期值，而不阻塞任何线程，所以这里用返回`std::experimental::future<user_id>`的`backend.async_authenticate_user`替代返回`user_id`的`backend.authenticate_user`
+
+持续性支持一种极为精妙的特性，叫做*future展开*(future-unwrapping)。当向`.then()`传递了持续性函数，并且返回一个`future<some_type>`类型的值时，相应的`.then()`返回值类型也是`future<some_type>`。最终的代码可能如下所示，这样在异步函数链上就不会阻塞了。
+
+代码4.21  处理用户登录——全异步操作
+
+```C++
+std::experimental::future<void> process_login(
+  std::string const& username, std::string const& password)
+{
+  return backend.async_authenticate_user(username, password).then(
+    [](std::experimental::future<user_id> id){
+      return backend.async_request_current_info(id.get());      
+    }).then([](std::experimental::future<user_data> info_to_display){
+      try{
+        update_display(info_to_display.get());  
+      } catch(std::exception& e){
+        display_error(e);
+      }
+    });
+}
+```
+
+除了[std::experimental::future](https://en.cppreference.com/w/cpp/experimental/future)，支持持续性的还有 [std::experimental::shared_future](https://en.cppreference.com/w/cpp/experimental/shared_future)
+
+```c++
+auto ft1 = new_async(some_function).share();
+auto ft2 = ft1.then([] (std::experimental::shared_future<some_data> data) {
+  do_stuff(data);
+});
+auto ft3 = ft1.then([] (std::experimental::shared_future<some_data> data) {
+  return do_other_stuff(data);
+});
+```
+
+### 等待多个future
+
+假设有很多的数据需要处理，每个数据都可以单独的进行处理，这就是利用硬件的好机会。可以使用异步任务组来处理数据项，每个任务通过future返回处理结果。不过，需要等待所有任务完成，才能得到最终的结果。
+
+代码4.22 使用`std::async`从多个future中收集结果
+
+```c++
+std::future<FinalResult> process_data(std::vector<MyData>& vec)
+{
+  size_t const chunk_size = whatever;
+  std::vector<std::future<ChunkResult>> results;
+  for (auto begin=vec.begin(), end=vec.end(); beg!=end;){
+    size_t const remaining_size = end - begin;
+    size_t const this_chunk_size = std::min(remaining_size, chunk_size);
+    results.push_back(
+      std::async(process_chunk, begin, begin+this_chunk_size));
+    begin += this_chunk_size;
+  }
+  return std::async([all_results=std::move(results)](){
+    std::vector<ChunkResult> v;
+    v.reserve(all_results.size());
+    for (auto& f : all_results)
+    {
+      v.push_back(f.get()); // 这里会导致反复唤醒，增加了很多开销  
+    }
+    return gather_results(v);
+  });
+}
+```
+
+可以使用` std::experimental::when_all`来避免这里的等待和切换，可以将需要等待的future传入when_all函数中，函数会返回新的future——当传入的future状态都为就绪时，新future的状态就会置为就绪，这个future可以和持续性配合起来处理其他的任务。
+
+```c++
+std::experimental::future<FinalResult> process_data(
+  std::vector<MyData>& vec)
+{
+  size_t const chunk_size = whatever;
+  std::vector<std::experimental::future<ChunkResult>> results;
+  for (auto begin = vec.begin(), end = vec.end(); beg != end){
+    size_t const remaining_size = end - begin;
+    size_t const this_chunk_size = std::min(remaining_size, chunk_size);
+    results.push_back(
+      spawn_async(
+        process_chunk, begin, begin+this_chunk_size));
+    begin += this_chunk_size;
+  }
+  return std::experimental::when_all(
+    results.begin(), results.end()).then( // 等待所有future的状态变为就绪
+      [](std::future<std::vector<std::experimental::future<ChunkResult>>> ready_results){
+        std::vector<std::experimental::future<ChunkResult>> all_results = ready_results.get();
+        std::vector<ChunkResult> v;
+        v.reserve(all_results.size());
+        for (auto& f: all_results){
+          v.push_back(f.get()); // 无阻塞的获得所有处理结果
+        }
+        return gather_results(v);
+      });
+}
+```
+
+### 使用when_any等待第一个future
+
+假设要在一大堆数据里面找一个符合要求的值(符合这样要求的值有很多)，找到任何一个即可。这种任务是可以并行的，可以多线程完成，每个任务去检查数据的一个子集，如果有线程找到了合适的值，这个线程就会设置一个标志，让其他线程停止搜索，并返回结果。这种情况下，还希望第一个完成搜索任务的线程，能对数据进行进一步的处理。
+
+这就可以使用` std::experimental::when_any`将future收集在一起，当future有一个为就绪时，任务即为完成。
+
+代码4.24 使用` std::experimental::when_any `处理第一个被找到的值
+
+```C++
+std::experimental::future<FinalResult>
+find_and_process_value(std::vector<MyData> &data)
+{
+  unsigned const concurrency = std::thread::hardware_concurrency();
+  unsigned const num_tasks = (concurrency > 0)? concurrency : 2；
+  std::vector<std::experimental::future<MyData *>> results;
+  auto const chunk_size = (data.size() + num_tasks - 1) / num_tasks;
+  auto chunk_begin = data.begin();
+  std::shared_ptr<std::atomic<bool>> done_flag = 
+      std::make_shared<std::atomic<bool>>(false);
+  for (unsigned i = 0; i < num_tasks; ++i){ // 初始化循环产生num_tasks个异步任务拷贝
+    auto chunk_end = 
+      (i < (num_tasks - 1)? chunk_begin + chunk_size : data.end());
+    results.push_back(spawn_async([=]{ // 拷贝方式
+      for (auto entry = chunk_begin;
+           !*done_flag && (entry != chunk_end);
+           ++entry){
+        if (matches_find_criteria(*entry)){
+          *done_flag = true;
+          return &*entry;
+        }
+      }
+      return (MyData *)nullptr;
+    }));
+    chunk_begin = chunk_end;
+  }
+    
+  std::shared_ptr<std::experimental::promise<FinalResult>> final_result =
+    std::make_shared<std::experimental::promise<FinalResult>>();
+    
+  struct DoneCheck {
+    std::shared_ptr<std::experimental::promise<FinalResult>>
+      final_result;
+      
+  DoneCheck(
+    std::shared_ptr<std::experimental::promise<FinalResult>>
+      final_result_)
+    : final_result(std::move(final_result_)) {}
+    
+  void operator()( // 4
+    std::experimental::future<std::experimental::when_any_result<
+      std::vector<std::experimental::future<MyData *>>>>
+        results_param) {
+    auto results = results_param.get();
+    MyData *const ready_result =
+      results.futures[results.index].get(); // 从就绪的future中获取值
+    if (ready_result)
+      final_result->set_value( // 当符合条件，对结果进行处理和设置
+        process_found_value(*ready_result));
+    else {
+      results.futures.erase(
+        results.futures.begin() + results.index); // 从集合中丢弃就绪的future
+      if (!results.futures.empty()) {
+        std::experimental::when_any( // 当还有很多future需要检查时
+          results.futures.begin(), results.futures.end())
+          .then(std::move(*this));
+      } else {
+        final_result->set_exception(
+          std::make_exception_ptr( //若这个值没有找到，将会在future中存储一个异常
+            std::runtime_error(“Not found”)));
+      }
+    }
+  };
+  std::experimental::when_any(results.begin(), results.end())
+  .then(DoneCheck(final_result)); // 通过连接持续性完成
+  return final_result->get_future(); // 函数的返回值是一个future，包含有最终的结果
+}
+```
+
+when_all和when_any除了可以接收一对迭代器，也可以直接接受期值
+
+```c++
+std::experimental::future<int> f1=spawn_async(func1);
+std::experimental::future<std::string> f2=spawn_async(func2);
+std::experimental::future<double> f3=spawn_async(func3);
+std::experimental::future<
+  std::tuple<
+    std::experimental::future<int>,
+    std::experimental::future<std::string>,
+    std::experimental::future<double>>> result=
+  std::experimental::when_all(std::move(f1),std::move(f2),std::move(f3));
+```
+
+### 锁存器和栅栏
+
+锁存器是一种同步对象，当计数器减为0时，就处于就绪态了。锁存器是基于其输出特性——当处于就绪态时，就会保持就绪态，直到被销毁。因此，锁存器是为同步一系列事件的轻量级机制。
+
+栅栏是一种可复用的同步机制，其用于一组线程间的内部同步。对于栅栏来说，每一个线程只能在每个周期到达栅栏一次。当线程都抵达栅栏时，会对线程进行阻塞，直到所有线程都达到栅栏处，这时阻塞将会被解除。
+
+栅栏可以复用——线程可以再次到达栅栏处，等待下一个周期的所有线程。
+
+### std::experimental::latch：基础的锁存器类型
+
+[std::experimental::latch](https://en.cppreference.com/w/cpp/experimental/latch)用一个计数器值构造，等待事件发生时就调用[std::experimental::latch::count_down](https://en.cppreference.com/w/cpp/experimental/latch/count_down)将计数器值减一，计数器值为0时则[std::experimental::latch::is_ready](https://en.cppreference.com/w/cpp/experimental/latch/is_ready)返回true，如果想让计数器减一并阻塞至0则可以调用[std::experimental::latch::count_down_and_wait](https://en.cppreference.com/w/cpp/experimental/latch/count_down_and_wait)
+
+代码4.25 使用` std::experimental::latch`等待所有事件
+
+```c++
+void foo(){
+  unsigned const thread_count=...;
+  latch done(thread_count); // 用计数器值构造latch
+  my_data data[thread_count];
+  std::vector<std::future<void> > threads;
+  for(unsigned i=0;i<thread_count;++i)
+    threads.push_back(std::async(std::launch::async,[&,i]{ // 产生线程
+      data[i]=make_data(i);
+      done.count_down(); // 在进行下一步之前先递减计数器
+      do_more_stuff(); 
+    }));
+  done.wait(); // 等待至计数器为0
+  process_data(data,thread_count); // 数据处理可能需要与线程的最终处理同步进行
+} // 在std::future析构之前，无法保证所有线程都已完成。
+```
+
+### std::experimental::barrier：简单的栅栏
+
+并发技术扩展规范提供了两种栅栏机制，`<experimental/barrier>`头文件中，分别为：`std::experimental::barrier` 和`std::experimental::flex_barrier` 。前者更简单，开销更低。后者更灵活，开销较大。
+
+一组处理数据的线程，处理过程中独立，无需同步，但在处理下一项数据前，必须要求所有线程完成任务。[std::experimental::barrier](https://en.cppreference.com/w/cpp/experimental/barrier)就可以用于处理这种情况，它用线程的数量构造，调用[std::experimental::barrier::arrive_and_wait](https://en.cppreference.com/w/cpp/experimental/barrier/arrive_and_wait)会阻塞至所有线程完成任务，当最后一个线程完成任务时，所有线程被释放，barrier被重置。如果想从线程集中移除线程，可以让该线程在barrier上调用[std::experimental::barrier::arrive_and_drop](https://en.cppreference.com/w/cpp/experimental/barrier/arrive_and_drop)
+
+代码4.26 ` std::experimental::barrier`的用法
+
+```c++
+result_chunk process(data_chunk);
+std::vector<data_chunk> divide_into_chunks(data_block data, unsigned num_threads);
+
+void process_data(data_source& source, data_sink& sink) // 源数据和输出数据
+{
+  const unsigned concurrency = std::thread::hardware_concurrency();
+  const unsigned num_threads = (concurrency > 0) ? concurrency : 2;
+  std::experimental::barrier b(num_threads); // 构造barrier
+  std::vector<joining_thread> threads(num_threads);
+  std::vector<data_chunk> chunks;
+  result_block res;
+  for (unsigned i = 0; i < num_threads; ++i)
+  {
+    threads[i] = joining_thread([&, i] {
+      while (!source.done()) // 循环至处理完所有任务
+      {
+        if (i == 0)
+        { // 线程0拆分数据
+          data_block current_block = source.get_next_data_block();
+          chunks = divide_into_chunks(current_block, num_threads);
+        }
+        b.arrive_and_wait(); // 这里阻塞是因为其他线程必须等待线程0初始化
+        res.set_chunk(i, num_threads, process(chunks[i])); // 更新结果到res
+        b.arrive_and_wait(); // 这里阻塞是因为写入前线程0必须等待其他线程完成
+        if (i == 0) sink.write_data(std::move(res)); // 只有线程0可以输出结果
+      }
+    });
+  }
+}
+```
+
+### std::experimental::flex_barrier—更灵活和更友好的std::experimental::barrier
+
+[std::experimental::flex_barrier](https://en.cppreference.com/w/cpp/experimental/flex_barrier)比[std::experimental::barrier](https://en.cppreference.com/w/cpp/experimental/barrier)，但开销更大，此外[std::experimental::flex_barrier](https://en.cppreference.com/w/cpp/experimental/flex_barrier)还要多接受一个函数作为参数，当所有线程到达阻塞点时，由其中一个线程运行该函数
+
+下面的代码展示了使用`std::experimental::flex_barrier`对代码4.26的进行重写：
+
+代码4.27 使用`std::experimental::flex_barrier`管理串行部分
+
+```c++
+void process_data(data_source& source, data_sink& sink)
+{
+  const unsigned concurrency = std::thread::hardware_concurrency();
+  const unsigned num_threads = (concurrency > 0) ? concurrency : 2;
+  std::vector<data_chunk> chunks;
+  auto split_source = [&] {
+    if (!source.done())
+    {
+      data_block current_block = source.get_next_data_block();
+      chunks = divide_into_chunks(current_block, num_threads);
+    }
+  };
+  split_source(); // 先调用上面的lambda拆分数据
+  result_block res;
+  std::experimental::flex_barrier sync(num_threads, [&] {
+    sink.write_data(std::move(res)); // 每次迭代完成输出一次结果
+    split_source(); // 并为下一次迭代拆分数据
+    return -1; // 必须返回不小于-1的值且不抛出异常，-1表示线程数不变
+    // 返回其他值则表示下一周期的线程数
+  });
+  std::vector<joining_thread> threads(num_threads);
+  for (unsigned i = 0; i < num_threads; ++i)
+  {
+    threads[i] = joining_thread([&, i] {
+      while (!source.done())
+      {
+        res.set_chunk(i, num_threads, process(chunks[i])); // 更新结果到res
+        sync.arrive_and_wait(); // 只需要一个阻塞点
+      }
+    });
+  }
+}
+```
+
